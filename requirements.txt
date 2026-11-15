@@ -1,0 +1,11 @@
+# Needed for screenshots of the app window you pick.
+Pillow>=10.0
+
+# Needed for translating Arabic -> English (uses the internet).
+deep-translator>=1.11
+
+# Needed for reading the Arabic text off the screen (OCR).
+# NOTE: pytesseract is only the messenger. You ALSO need the free
+# Tesseract program itself, installed with Arabic language data —
+# see README.txt for the exact download and the checkbox to tick.
+pytesseract>=0.3.10
