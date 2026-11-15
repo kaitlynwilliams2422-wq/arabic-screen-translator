@@ -34,15 +34,25 @@ import threading
 try:
     import tkinter as tk
     from tkinter import ttk, messagebox, filedialog
+    from tkinter import font as tkfont
 except Exception:  # pragma: no cover - no display / no tk
     tk = None
     ttk = None
     messagebox = None
     filedialog = None
+    tkfont = None
 
 APP_TITLE = "Mia's Arabic Screen Translator"
 SAMPLE_SENTENCE = "أَهْلًا، كَيْفَ حَالُكَ الْيَوْمَ؟"
 WHOLE_SCREEN = "SCREEN"  # sentinel hwnd value for the whole screen
+# Titles of THIS app's own windows. The window picker never lists
+# them (the app should not watch itself), and the Screen Translate
+# cover overlay gets its own distinct title so it can be filtered
+# out of the list and told apart from everything else.
+SCREEN_OVERLAY_TITLE = "MiaTranslatorOverlay"
+SMALL_OVERLAY_TITLE = "Translation overlay"
+OWN_WINDOW_TITLES = (APP_TITLE, SCREEN_OVERLAY_TITLE,
+                     SMALL_OVERLAY_TITLE)
 
 BG = "#0e0f13"
 PANEL = "#17181d"
@@ -111,6 +121,60 @@ def sort_windows(windows):
         else:
             others.append((hwnd, title))
     return roblox + others
+
+
+def window_process_id(hwnd):
+    """The id of the process that owns a window (Windows only).
+
+    Returns None on other systems, for the whole-screen sentinel,
+    or on any error. Callers must treat None as "unknown" — never
+    as a match for any process.
+    """
+    if sys.platform != "win32" or hwnd in (None, WHOLE_SCREEN):
+        return None
+    try:
+        import ctypes
+        from ctypes import wintypes
+
+        pid = wintypes.DWORD(0)
+        ctypes.windll.user32.GetWindowThreadProcessId(
+            wintypes.HWND(hwnd), ctypes.byref(pid))
+        return int(pid.value) or None
+    except Exception:
+        return None
+
+
+def filter_own_windows(windows, own_pid=None, pid_of=None,
+                       own_titles=()):
+    """Drop THIS app's own windows from a [(hwnd, title)] list.
+
+    The app must never watch or list itself: its own windows in
+    the picker look like duplicates, and watching them makes the
+    app read its own labels. A window is dropped when its title
+    is one of `own_titles`, or when the process that owns it is
+    this app's own process (`own_pid`, default: this process).
+    `pid_of(hwnd)` looks up a window's process id — the default
+    is window_process_id; tests pass a stub. A window whose pid
+    is unknown (None) is always kept: only sure matches drop.
+    Never raises.
+    """
+    if own_pid is None:
+        own_pid = os.getpid()
+    if pid_of is None:
+        pid_of = window_process_id
+    titles = set(own_titles or ())
+    kept = []
+    for hwnd, title in windows or []:
+        if title in titles:
+            continue
+        try:
+            pid = pid_of(hwnd)
+        except Exception:
+            pid = None
+        if pid is not None and pid == own_pid:
+            continue
+        kept.append((hwnd, title))
+    return kept
 
 
 def chat_crop_box(rect):
@@ -623,6 +687,34 @@ def label_font_size(box_height):
     except Exception:
         size = 11
     return max(9, min(16, size))
+
+
+def label_size(text, box, font):
+    """The exact pixel size of a Screen Translate cover label.
+
+    A label is a SMALL dark box that fits its English text and
+    nothing more: width = the measured text width + 10 px of
+    padding total; height = the taller of the line's box height
+    and the font's height + 4. It is never stretched to the line
+    box's width, and never anywhere near the overlay/screen size.
+    `font` is anything with .measure(text) and .metrics(...)
+    methods — a tkinter Font in the app, a stub in tests.
+    Never raises.
+    """
+    try:
+        text_w = int(font.measure(text))
+    except Exception:
+        text_w = len(text or "") * 7
+    try:
+        font_h = int(font.metrics("linespace"))
+    except Exception:
+        font_h = 13
+    box_h = 0
+    try:
+        box_h = int(box[3])
+    except Exception:
+        box_h = 0
+    return (text_w + 10, max(box_h, font_h + 4))
 
 
 # ---------------------------------------------------------------------
@@ -1277,6 +1369,7 @@ if tk is not None:
             self._screen_signature = None
             self._screen_job = None
             self._screen_busy = False
+            self._screen_fonts = {}  # font size -> tkfont.Font
 
             # ----- header -----
             header = tk.Frame(root, bg=BG)
@@ -1560,7 +1653,7 @@ if tk is not None:
 
             # ----- overlay window -----
             self.overlay = tk.Toplevel(root)
-            self.overlay.title("Translation overlay")
+            self.overlay.title(SMALL_OVERLAY_TITLE)
             self.overlay.overrideredirect(True)
             self.overlay.configure(bg="#101014")
             try:
@@ -1666,7 +1759,12 @@ if tk is not None:
 
         def refresh_windows(self):
             self.window_choices = [("🌐 Whole Screen", WHOLE_SCREEN)]
-            for hwnd, disp_title in sort_windows(list_open_windows()):
+            # Never list this app's own windows — watching them
+            # makes the app read itself, and they look like
+            # duplicate windows in the picker.
+            wins = filter_own_windows(
+                list_open_windows(), own_titles=OWN_WINDOW_TITLES)
+            for hwnd, disp_title in sort_windows(wins):
                 label = disp_title if len(disp_title) <= 70 \
                     else disp_title[:67] + "..."
                 self.window_choices.append((label, hwnd))
@@ -1811,7 +1909,14 @@ if tk is not None:
                 note = ("Screen Translate is ON — English labels "
                         "cover the Arabic where it sits.")
                 self.screen_note_label.configure(text=note)
-                self._ensure_screen_overlay()
+                if self._ensure_screen_overlay() is None:
+                    # The problem was already put in plain words
+                    # on the status line — turn the mode back off
+                    # instead of scanning with no overlay.
+                    self.screen_translate_on = False
+                    self.screen_var.set(False)
+                    self.screen_note_label.configure(text="")
+                    return
                 self.set_status(note)
                 self._screen_tick()
             else:
@@ -1826,11 +1931,19 @@ if tk is not None:
                 self.set_status("Screen Translate is off.")
 
         def _ensure_screen_overlay(self):
-            """Create the full-area cover overlay if needed.
+            """The ONE cover overlay window, created lazily once
+            and then reused forever.
 
-            Its background color is made invisible on Windows
-            (transparent color), so only the English labels show.
-            Returns the overlay window.
+            Toggling Screen Translate off only hides it; toggling
+            on shows the SAME window again. Redraws replace only
+            the label widgets inside it — the window itself is
+            never recreated, so it can never duplicate.
+
+            The window's own background is exactly the transparent
+            color key and it has NO full-size child widget: it is
+            invisible everywhere except its small labels. Returns
+            the overlay, or None (with the problem already said in
+            plain words on the status line) if creating it failed.
             """
             if self.screen_overlay is not None:
                 try:
@@ -1838,20 +1951,29 @@ if tk is not None:
                         return self.screen_overlay
                 except Exception:
                     self.screen_overlay = None
-            ov = tk.Toplevel(self.root)
-            ov.title("Screen Translate overlay")
-            ov.overrideredirect(True)
-            ov.configure(bg=SCREEN_OVERLAY_KEY)
             try:
-                ov.attributes("-topmost", True)
-            except Exception:
-                pass
-            try:
-                ov.attributes("-transparentcolor", SCREEN_OVERLAY_KEY)
-            except Exception:
-                # Not Windows (test machines): the overlay still
-                # draws, just without the see-through background.
-                pass
+                ov = tk.Toplevel(self.root)
+                ov.title(SCREEN_OVERLAY_TITLE)
+                ov.overrideredirect(True)
+                ov.configure(bg=SCREEN_OVERLAY_KEY)
+                try:
+                    ov.attributes("-topmost", True)
+                except Exception:
+                    pass
+                try:
+                    ov.attributes("-transparentcolor",
+                                  SCREEN_OVERLAY_KEY)
+                except Exception:
+                    # Not Windows (test machines): the overlay
+                    # still draws, just without the see-through
+                    # background.
+                    pass
+            except Exception as exc:
+                self.screen_overlay = None
+                self.set_status(
+                    "Screen Translate could not open its label "
+                    "window: %s" % exc)
+                return None
             self.screen_overlay = ov
             self.screen_labels = []
             self._screen_signature = None
@@ -1864,62 +1986,94 @@ if tk is not None:
                 except Exception:
                     pass
 
+        def _reshow_screen_overlay(self):
+            """Show the cover overlay again (main thread only).
+
+            Used after a scan that hid it for the screenshot but
+            then failed, so the labels do not stay hidden.
+            """
+            if not self.screen_translate_on:
+                return
+            ov = self.screen_overlay
+            if ov is not None:
+                try:
+                    if ov.winfo_exists():
+                        ov.deiconify()
+                        ov.lift()
+                except Exception:
+                    pass
+
         def _make_screen_overlay_click_through(self):
-            """Windows only: let mouse clicks pass through the
-            cover overlay to the game underneath
-            (WS_EX_TRANSPARENT), keep it see-through
-            (WS_EX_LAYERED) and on top (WS_EX_TOPMOST).
-            Guarded — if anything fails, the overlay just stays
-            a normal (still working) window."""
+            """Windows only: style the cover overlay so clicks
+            pass through it to the game underneath
+            (WS_EX_TRANSPARENT), it stays see-through
+            (WS_EX_LAYERED) and on top (WS_EX_TOPMOST), and it
+            counts as a tool window (WS_EX_TOOLWINDOW, with
+            WS_EX_APPWINDOW removed) so it never shows up as a
+            separate app window in the taskbar or Alt-Tab.
+
+            The style value is pointer-sized on 64-bit Windows,
+            so the functions get proper argtypes/restype —
+            without them ctypes cuts the value down to 32 bits
+            and can hand back a broken style. The WHOLE thing is
+            guarded: if anything at all fails, the overlay just
+            stays a normal (still working, not click-through)
+            window. This must never crash the app.
+            """
             if sys.platform != "win32" \
                     or self.screen_overlay is None:
                 return
             try:
                 import ctypes
+                from ctypes import wintypes
+
                 hwnd = self.screen_overlay.winfo_id()
                 user32 = ctypes.windll.user32
                 GWL_EXSTYLE = -20
-                WS_EX_LAYERED = 0x00080000
-                WS_EX_TRANSPARENT = 0x00000020
                 WS_EX_TOPMOST = 0x00000008
-                get_long = getattr(user32, "GetWindowLongPtrW",
-                                   user32.GetWindowLongW)
-                set_long = getattr(user32, "SetWindowLongPtrW",
-                                   user32.SetWindowLongW)
-                style = get_long(hwnd, GWL_EXSTYLE)
-                set_long(hwnd, GWL_EXSTYLE,
-                         style | WS_EX_LAYERED | WS_EX_TRANSPARENT
-                         | WS_EX_TOPMOST)
+                WS_EX_TRANSPARENT = 0x00000020
+                WS_EX_TOOLWINDOW = 0x00000080
+                WS_EX_APPWINDOW = 0x00040000
+                WS_EX_LAYERED = 0x00080000
+                try:
+                    get_long = user32.GetWindowLongPtrW
+                    set_long = user32.SetWindowLongPtrW
+                except Exception:
+                    get_long = user32.GetWindowLongW
+                    set_long = user32.SetWindowLongW
+                try:
+                    get_long.argtypes = [wintypes.HWND,
+                                         ctypes.c_int]
+                    get_long.restype = ctypes.c_ssize_t
+                    set_long.argtypes = [wintypes.HWND,
+                                         ctypes.c_int,
+                                         ctypes.c_ssize_t]
+                    set_long.restype = ctypes.c_ssize_t
+                except Exception:
+                    pass
+                style = int(get_long(wintypes.HWND(hwnd),
+                                     GWL_EXSTYLE))
+                style |= (WS_EX_LAYERED | WS_EX_TRANSPARENT
+                          | WS_EX_TOPMOST | WS_EX_TOOLWINDOW)
+                style &= ~WS_EX_APPWINDOW
+                set_long(wintypes.HWND(hwnd), GWL_EXSTYLE,
+                         ctypes.c_ssize_t(style))
             except Exception:
                 pass
 
         def capture_for_screen_translate(self, bbox=None):
             """Screenshot for a Screen Translate scan.
 
-            The cover overlay is hidden for the instant of the
-            capture (withdraw -> capture -> show again), so its
-            own labels can never be read back. (They are English,
-            so the Arabic filter would ignore them anyway — this
-            is belt-and-suspenders.) Returns (image, error),
-            like capture_screen.
+            Just a capture — NO window tricks in here. The cover
+            overlay is hidden for the screenshot by _screen_tick
+            on the main thread (and shown again when the scan is
+            applied), because tkinter calls from a worker thread
+            are not safe and can crash the app. The labels are
+            English anyway, so the Arabic filter would ignore
+            them even if one slipped into a shot. Returns
+            (image, error), like capture_screen.
             """
-            ov = self.screen_overlay
-            hidden = False
-            if ov is not None:
-                try:
-                    ov.withdraw()
-                    hidden = True
-                    time.sleep(0.08)
-                except Exception:
-                    hidden = False
-            try:
-                return capture_screen(bbox)
-            finally:
-                if hidden and ov is not None:
-                    try:
-                        ov.deiconify()
-                    except Exception:
-                        pass
+            return capture_screen(bbox)
 
         def _screen_tick(self):
             if not self.screen_translate_on:
@@ -1927,6 +2081,13 @@ if tk is not None:
             if not self._screen_busy:
                 self._screen_busy = True
                 _label, hwnd = self._selected_target()
+                # Hide the cover overlay HERE, on the main
+                # thread, so its labels are out of the screenshot
+                # the worker is about to take. The worker thread
+                # itself must never touch tkinter — results come
+                # back through the queue, and _apply_screen_scan
+                # (main thread) shows the overlay again.
+                self._hide_screen_overlay()
                 threading.Thread(
                     target=self._screen_scan_worker,
                     args=(hwnd, self.clear_mode_on),
@@ -1935,14 +2096,25 @@ if tk is not None:
                 SCREEN_TRANSLATE_INTERVAL_MS, self._screen_tick)
 
         def _screen_scan_worker(self, hwnd, clear_mode):
+            """Worker thread: screenshot -> OCR -> translate.
+
+            NO tkinter calls in here, ever — everything for the
+            screen goes back through self._queue and is applied
+            on the main thread. Problems are reported as
+            "screen_error" so the main thread can also show the
+            (hidden-for-the-screenshot) overlay again.
+            """
             try:
+                # Give the overlay hidden by _screen_tick a
+                # moment to actually leave the screen.
+                time.sleep(0.08)
                 bbox = None
                 rect = None
                 if hwnd != WHOLE_SCREEN:
                     rect = get_window_rect(hwnd)
                     if rect is None:
                         self._queue.put(
-                            ("status",
+                            ("screen_error",
                              "Screen Translate: that window is "
                              "gone — pick it again or use Whole "
                              "Screen."))
@@ -1950,7 +2122,7 @@ if tk is not None:
                     bbox = rect
                 img, err = self.capture_for_screen_translate(bbox)
                 if img is None:
-                    self._queue.put(("status", err))
+                    self._queue.put(("screen_error", err))
                     return
                 if rect is None:
                     rect = (0, 0, img.size[0], img.size[1])
@@ -1958,67 +2130,117 @@ if tk is not None:
                     img, clear=clear_mode)
                 if err:
                     self._queue.put(
-                        ("status", "Screen Translate: " + err))
+                        ("screen_error",
+                         "Screen Translate: " + err))
                     return
                 items = translate_screen_lines(
                     lines, cache=self.screen_translations)
                 self._queue.put(("screen", (rect, items)))
             except Exception as exc:
                 self._queue.put(
-                    ("status", "Screen Translate went wrong: %s"
-                     % exc))
+                    ("screen_error",
+                     "Screen Translate went wrong: %s" % exc))
             finally:
                 self._screen_busy = False
+
+        def _screen_font(self, size):
+            """A bold Segoe UI font at `size`, cached per size.
+
+            Returns None when tkinter fonts are unavailable, so
+            callers can fall back to a font description tuple.
+            """
+            if tkfont is None:
+                return None
+            font = self._screen_fonts.get(size)
+            if font is None:
+                try:
+                    font = tkfont.Font(family="Segoe UI",
+                                       size=size, weight="bold")
+                except Exception:
+                    return None
+                self._screen_fonts[size] = font
+            return font
 
         def _apply_screen_scan(self, rect, items):
             """Position the cover overlay over exactly the watched
             area and redraw its labels — but only when the set of
-            (line, box, English) changed, so it does not flicker."""
+            (line, box, English) changed, so it does not flicker.
+
+            The overlay window itself is invisible (its background
+            is the transparent color key); the ONLY things drawn
+            are small dark labels, each exactly as big as its
+            English text — never stretched across the line's box
+            or the screen. A label that would run past the right
+            edge is slid left just enough to stay on screen, at
+            the same text size. The whole step is guarded: a
+            problem is said in plain words on the status line
+            instead of crashing the app.
+            """
             if not self.screen_translate_on:
                 return
-            ov = self._ensure_screen_overlay()
-            left, top, right, bottom = rect
-            width = max(1, right - left)
-            height = max(1, bottom - top)
             try:
-                ov.geometry("%dx%d%s%d%s%d" % (
-                    width, height,
-                    "+" if left >= 0 else "-", abs(left),
-                    "+" if top >= 0 else "-", abs(top)))
-                ov.deiconify()
-                ov.lift()
-            except Exception:
-                pass
-            self._make_screen_overlay_click_through()
-            signature = tuple(
-                (it["text"], it["box"], it["english"])
-                for it in items)
-            if signature == self._screen_signature:
-                return  # nothing changed — no flicker
-            self._screen_signature = signature
-            for child in ov.winfo_children():
-                child.destroy()
-            self.screen_labels = []
-            for it in items:
-                bx, by, bw, bh = it["box"]
-                screen_box = (left + bx, top + by, bw, bh)
-                x, y, w, h = label_geometry(screen_box, (left, top))
-                size = label_font_size(bh)
-                # English is often longer than the Arabic — give
-                # the label room, but never past the overlay edge.
-                need = int(len(it["english"]) * size * 0.58) + 12
-                w = max(w, need)
-                if x + w > width:
-                    w = max(10, width - x)
-                lbl = tk.Label(ov, text=it["english"],
-                               bg=SCREEN_LABEL_BG,
-                               fg=SCREEN_LABEL_FG,
-                               font=("Segoe UI", size, "bold"),
-                               padx=4, pady=1, justify="left",
-                               anchor="w")
-                lbl.place(x=x, y=y, width=w,
-                          height=max(h, size + 10))
-                self.screen_labels.append(lbl)
+                ov = self._ensure_screen_overlay()
+                if ov is None:
+                    return
+                left, top, right, bottom = rect
+                width = max(1, right - left)
+                height = max(1, bottom - top)
+                try:
+                    ov.geometry("%dx%d%s%d%s%d" % (
+                        width, height,
+                        "+" if left >= 0 else "-", abs(left),
+                        "+" if top >= 0 else "-", abs(top)))
+                    ov.deiconify()
+                    ov.lift()
+                except Exception:
+                    pass
+                self._make_screen_overlay_click_through()
+                signature = tuple(
+                    (it["text"], it["box"], it["english"])
+                    for it in items)
+                if signature == self._screen_signature:
+                    return  # nothing changed — no flicker
+                self._screen_signature = signature
+                # Replace only the labels — the overlay window
+                # itself is the same one, reused forever.
+                for child in ov.winfo_children():
+                    child.destroy()
+                self.screen_labels = []
+                for it in items:
+                    bx, by, bw, bh = it["box"]
+                    x, y, _bw, _bh = label_geometry(
+                        (left + bx, top + by, bw, bh), (left, top))
+                    size = label_font_size(bh)
+                    font = self._screen_font(size)
+                    if font is not None:
+                        w, h = label_size(it["english"],
+                                          it["box"], font)
+                    else:
+                        w = len(it["english"]) * size // 2 + 10
+                        h = max(bh, size + 4)
+                    # Slide the little box back on screen if it
+                    # would spill past an edge — same text size,
+                    # never stretched.
+                    if x + w > width:
+                        x = max(0, width - w)
+                    if x < 0:
+                        x = 0
+                    if y + h > height:
+                        y = max(0, height - h)
+                    if y < 0:
+                        y = 0
+                    lbl = tk.Label(
+                        ov, text=it["english"],
+                        bg=SCREEN_LABEL_BG, fg=SCREEN_LABEL_FG,
+                        font=font if font is not None
+                        else ("Segoe UI", size, "bold"),
+                        padx=2, pady=0, justify="left", anchor="w")
+                    lbl.place(x=x, y=y, width=w, height=h)
+                    self.screen_labels.append(lbl)
+            except Exception as exc:
+                self.set_status(
+                    "Screen Translate hit a problem and skipped "
+                    "this update: %s" % exc)
 
         # ---------- favorites ----------
 
@@ -2201,6 +2423,13 @@ if tk is not None:
                     elif kind == "screen":
                         rect, items = payload
                         self._apply_screen_scan(rect, items)
+                    elif kind == "screen_error":
+                        self.set_status(payload)
+                        # The scan hid the overlay for its
+                        # screenshot and then failed — show the
+                        # labels again instead of leaving them
+                        # hidden.
+                        self._reshow_screen_overlay()
                     elif kind == "mywords":
                         arabic, error = payload
                         if arabic is not None:

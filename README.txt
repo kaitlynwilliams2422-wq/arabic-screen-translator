@@ -156,6 +156,11 @@ screen). Every piece of Arabic text it finds gets an English
 label drawn right on top of it, in the same spot — so you can
 read the whole screen like it was written in English.
 
+- Each label is a SMALL black box that fits just the English
+  words in it, exactly — nothing bigger. The rest of the
+  screen stays see-through, so you always see your game
+  underneath. There is never a big black screen.
+
 - The labels update every few seconds. Brand-new text can
   take a couple of seconds to get its label.
 
@@ -172,6 +177,10 @@ read the whole screen like it was written in English.
 
 - The normal chat translations and reply ideas keep working
   while Screen Translate is on.
+
+- The app hides its own windows from the window picker list,
+  so it never tries to watch itself, and its label window
+  never shows up as an extra app on your taskbar.
 
 
 ONE HONEST THING ABOUT ROBLOX AND ARABIC
