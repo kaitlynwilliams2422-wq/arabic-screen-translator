@@ -68,6 +68,12 @@ WHAT'S INSIDE
   translations — and the top reply idea — so you can glance
   without switching windows. You can change its text size.
 
+- Screen Translate mode: cover the whole watched window (or
+  the whole screen) with English. Every piece of Arabic text
+  it can see gets an English label drawn right on top of it,
+  where it sits — not just the chat box, everything. See the
+  "SCREEN TRANSLATE MODE" part below.
+
 - Save chat log: one button saves everything translated this
   time into chat_log.txt in the app folder.
 
@@ -137,6 +143,35 @@ HOW TO USE IT (WITH ROBLOX)
 
 7) Press Stop when you are done. "Save chat log" keeps a copy
    of everything that was translated.
+
+
+SCREEN TRANSLATE MODE
+
+Chat mode reads just the chat box. Screen Translate reads
+EVERYTHING.
+
+Tick "Screen Translate: cover the whole screen with English"
+and the app looks at the whole window you picked (or the whole
+screen). Every piece of Arabic text it finds gets an English
+label drawn right on top of it, in the same spot — so you can
+read the whole screen like it was written in English.
+
+- The labels update every few seconds. Brand-new text can
+  take a couple of seconds to get its label.
+
+- Your mouse clicks pass straight through the labels, so you
+  can keep playing like they are not even there.
+
+- The labels only COVER the Arabic on your screen — they do
+  not change the game or the app itself. Untick the box and
+  everything is back to normal.
+
+- If a piece of text cannot be translated (the internet
+  hiccups, or the reading was too fuzzy), that spot is left
+  uncovered instead of being covered with wrong words.
+
+- The normal chat translations and reply ideas keep working
+  while Screen Translate is on.
 
 
 ONE HONEST THING ABOUT ROBLOX AND ARABIC

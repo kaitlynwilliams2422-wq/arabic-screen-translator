@@ -5,7 +5,9 @@ Mia's Arabic Screen Translator
 Pick an app window (or the whole screen), and this app watches it.
 When it sees Arabic text, it reads the text (OCR), writes it in
 English letters (transliteration), and translates it into English —
-live, in the app and in a little overlay window.
+live, in the app and in a little overlay window. Screen Translate
+mode goes further: it reads ALL the Arabic in the watched window
+and draws an English label right on top of each line, in place.
 
 Honest notes:
 - Reading the screen needs the free Tesseract program with Arabic
@@ -421,6 +423,206 @@ def ocr_image(image, clear=True):
         return text or "", None
     except Exception as exc:
         return None, "Reading the screen failed: %s" % exc
+
+
+# ---------------------------------------------------------------------
+# Screen Translate: read Arabic lines WITH their positions, so an
+# English label can be drawn right on top of each line, in place —
+# the whole watched window/screen, not just the chat box.
+# ---------------------------------------------------------------------
+
+SCREEN_TRANSLATE_INTERVAL_MS = 2500  # time between full-area scans
+SCREEN_LABEL_BG = "#111111"
+SCREEN_LABEL_FG = "#ffe95e"
+# The cover overlay's background color. On Windows this exact color
+# is made invisible (transparent color), so only the English labels
+# show and the game shines through everywhere else.
+SCREEN_OVERLAY_KEY = "#ff00ff"
+
+
+def group_words_into_lines(data, scale=1.0, min_conf=40):
+    """Group pytesseract image_to_data output into lines with boxes.
+
+    Pure function — takes the raw data dict (as returned by
+    pytesseract.image_to_data with Output.DICT). Words whose
+    confidence is below min_conf are dropped (the same rule as
+    filter_low_confidence). Words are grouped by
+    (block_num, par_num, line_num), in reading order.
+
+    Returns [{"text": str, "box": (x, y, w, h)}, ...] where each
+    box is the union of the line's word boxes, DIVIDED by `scale`
+    (the OCR preprocessing upscale) so the coordinates are in the
+    ORIGINAL image's pixels. Never raises; bad data gives [].
+    """
+    try:
+        words = data.get("text", []) or []
+        n = len(words)
+
+        def column(name, default):
+            values = data.get(name) or []
+            return [values[i] if i < len(values) else default
+                    for i in range(n)]
+
+        confs = column("conf", -1)
+        lefts = column("left", 0)
+        tops = column("top", 0)
+        widths = column("width", 0)
+        heights = column("height", 0)
+        blocks = column("block_num", 0)
+        pars = column("par_num", 0)
+        line_nums = column("line_num", 0)
+
+        try:
+            factor = float(scale)
+        except Exception:
+            factor = 1.0
+        if factor <= 0:
+            factor = 1.0
+
+        grouped = {}
+        order = []
+        for i, word in enumerate(words):
+            if word is None or not str(word).strip():
+                continue
+            try:
+                conf = float(confs[i])
+            except Exception:
+                conf = -1
+            if conf < min_conf:
+                continue
+            try:
+                x0 = float(lefts[i])
+                y0 = float(tops[i])
+                x1 = x0 + float(widths[i])
+                y1 = y0 + float(heights[i])
+            except Exception:
+                continue
+            key = (blocks[i], pars[i], line_nums[i])
+            if key not in grouped:
+                grouped[key] = {"words": [], "x0": None, "y0": None,
+                                "x1": None, "y1": None}
+                order.append(key)
+            entry = grouped[key]
+            entry["words"].append(str(word))
+            entry["x0"] = x0 if entry["x0"] is None \
+                else min(entry["x0"], x0)
+            entry["y0"] = y0 if entry["y0"] is None \
+                else min(entry["y0"], y0)
+            entry["x1"] = x1 if entry["x1"] is None \
+                else max(entry["x1"], x1)
+            entry["y1"] = y1 if entry["y1"] is None \
+                else max(entry["y1"], y1)
+
+        lines = []
+        for key in order:
+            entry = grouped[key]
+            if entry["x0"] is None:
+                continue
+            box = (int(round(entry["x0"] / factor)),
+                   int(round(entry["y0"] / factor)),
+                   int(round((entry["x1"] - entry["x0"]) / factor)),
+                   int(round((entry["y1"] - entry["y0"]) / factor)))
+            lines.append({"text": " ".join(entry["words"]),
+                          "box": box})
+        return lines
+    except Exception:
+        return []
+
+
+def screen_translate_lines(lines):
+    """Keep only the lines that should get an English cover label:
+    the ones whose text contains Arabic."""
+    return [ln for ln in (lines or [])
+            if contains_arabic((ln or {}).get("text", ""))]
+
+
+def ocr_lines_with_boxes(image, clear=True):
+    """Read an image and return its Arabic lines WITH positions.
+
+    Returns (lines, error). lines is a list of
+    {"text": str, "box": (x, y, w, h)} — only lines containing
+    Arabic — with boxes in the ORIGINAL image's pixel coordinates
+    (the 2x OCR upscale is divided back out). When reading is not
+    ready, returns ([], message). When image_to_data fails,
+    returns ([], None): no made-up boxes, ever. Never raises.
+    """
+    ok, msg = ocr_status()
+    if not ok:
+        return [], msg
+    try:
+        import pytesseract
+        prepared = preprocess_for_ocr(image, clear=clear)
+        scale = 1.0
+        try:
+            if image is not None and image.size[0]:
+                scale = prepared.size[0] / float(image.size[0])
+        except Exception:
+            scale = 1.0
+        try:
+            data = pytesseract.image_to_data(
+                prepared, lang="ara",
+                output_type=pytesseract.Output.DICT)
+        except Exception:
+            return [], None
+        lines = group_words_into_lines(data, scale=scale)
+        return screen_translate_lines(lines), None
+    except Exception as exc:
+        return [], "Reading the screen failed: %s" % exc
+
+
+def translate_screen_lines(lines, cache=None, translate_fn=None):
+    """Attach English to OCR lines for Screen Translate mode.
+
+    Returns [{"text", "box", "english"}] for lines that contain
+    Arabic AND translated fine. A line whose translation fails is
+    skipped — its spot stays uncovered instead of being covered
+    with wrong words. `cache` is a dict of line text -> English,
+    reused across scans so the same line is not re-translated
+    (translate_to_english has its own cache too).
+    """
+    if translate_fn is None:
+        translate_fn = translate_to_english
+    if cache is None:
+        cache = {}
+    out = []
+    for ln in screen_translate_lines(lines):
+        text = (ln.get("text") or "").strip()
+        if not text:
+            continue
+        english = cache.get(text)
+        if english is None:
+            english, _error = translate_fn(text)
+            if not english:
+                continue
+            cache[text] = english
+        out.append({"text": text, "box": ln.get("box"),
+                    "english": english})
+    return out
+
+
+def label_geometry(box, overlay_origin):
+    """Where a cover label goes, relative to the overlay window.
+
+    `box` is (x, y, w, h) in SCREEN coordinates; `overlay_origin`
+    is the (left, top) screen position of the overlay window.
+    Returns (x, y, w, h) relative to the overlay's top-left corner.
+    """
+    x, y, w, h = box
+    ox, oy = overlay_origin
+    return (int(x) - int(ox), int(y) - int(oy), int(w), int(h))
+
+
+def label_font_size(box_height):
+    """Pick a cover-label font size from the line's box height.
+
+    A bit smaller than the box, clamped to 9..16 so labels stay
+    readable on tiny chat text and calm on big headings.
+    """
+    try:
+        size = int(round(float(box_height) * 0.62))
+    except Exception:
+        size = 11
+    return max(9, min(16, size))
 
 
 # ---------------------------------------------------------------------
@@ -1067,6 +1269,14 @@ if tk is not None:
             self._reply_offset = 0
             self.current_ideas = []
             self.my_arabic = ""
+            # Screen Translate (cover-in-place) state
+            self.screen_translate_on = False
+            self.screen_overlay = None
+            self.screen_labels = []
+            self.screen_translations = {}
+            self._screen_signature = None
+            self._screen_job = None
+            self._screen_busy = False
 
             # ----- header -----
             header = tk.Frame(root, bg=BG)
@@ -1178,6 +1388,23 @@ if tk is not None:
                       variable=self.overlay_size_var, length=90,
                       command=lambda *_: self._update_overlay()).pack(
                           side="left")
+
+            # ----- screen translate -----
+            controls3 = tk.Frame(root, bg=PANEL)
+            controls3.pack(fill="x", padx=12, pady=(0, 6))
+            self.screen_var = tk.BooleanVar(value=False)
+            tk.Checkbutton(
+                controls3,
+                text="🖥️ Screen Translate: cover the whole screen "
+                     "with English",
+                variable=self.screen_var, bg=PANEL, fg=TEXT,
+                selectcolor=CARD, activebackground=PANEL,
+                activeforeground=TEXT,
+                command=self._sync_screen_translate).pack(
+                    side="left", padx=8, pady=4)
+            self.screen_note_label = tk.Label(
+                controls3, text="", bg=PANEL, fg=GOOD)
+            self.screen_note_label.pack(side="left", padx=4)
 
             # ----- status lines -----
             self.ocr_label = tk.Label(root, text="", bg=BG, fg=WARN,
@@ -1378,6 +1605,7 @@ if tk is not None:
 
         def _on_close(self):
             self.watching = False
+            self.screen_translate_on = False
             self.root.destroy()
 
         def _update_ocr_label(self):
@@ -1575,6 +1803,223 @@ if tk is not None:
             except Exception:
                 pass
 
+        # ---------- screen translate (cover-in-place) ----------
+
+        def _sync_screen_translate(self):
+            self.screen_translate_on = bool(self.screen_var.get())
+            if self.screen_translate_on:
+                note = ("Screen Translate is ON — English labels "
+                        "cover the Arabic where it sits.")
+                self.screen_note_label.configure(text=note)
+                self._ensure_screen_overlay()
+                self.set_status(note)
+                self._screen_tick()
+            else:
+                self.screen_note_label.configure(text="")
+                if self._screen_job is not None:
+                    try:
+                        self.root.after_cancel(self._screen_job)
+                    except Exception:
+                        pass
+                    self._screen_job = None
+                self._hide_screen_overlay()
+                self.set_status("Screen Translate is off.")
+
+        def _ensure_screen_overlay(self):
+            """Create the full-area cover overlay if needed.
+
+            Its background color is made invisible on Windows
+            (transparent color), so only the English labels show.
+            Returns the overlay window.
+            """
+            if self.screen_overlay is not None:
+                try:
+                    if self.screen_overlay.winfo_exists():
+                        return self.screen_overlay
+                except Exception:
+                    self.screen_overlay = None
+            ov = tk.Toplevel(self.root)
+            ov.title("Screen Translate overlay")
+            ov.overrideredirect(True)
+            ov.configure(bg=SCREEN_OVERLAY_KEY)
+            try:
+                ov.attributes("-topmost", True)
+            except Exception:
+                pass
+            try:
+                ov.attributes("-transparentcolor", SCREEN_OVERLAY_KEY)
+            except Exception:
+                # Not Windows (test machines): the overlay still
+                # draws, just without the see-through background.
+                pass
+            self.screen_overlay = ov
+            self.screen_labels = []
+            self._screen_signature = None
+            return ov
+
+        def _hide_screen_overlay(self):
+            if self.screen_overlay is not None:
+                try:
+                    self.screen_overlay.withdraw()
+                except Exception:
+                    pass
+
+        def _make_screen_overlay_click_through(self):
+            """Windows only: let mouse clicks pass through the
+            cover overlay to the game underneath
+            (WS_EX_TRANSPARENT), keep it see-through
+            (WS_EX_LAYERED) and on top (WS_EX_TOPMOST).
+            Guarded — if anything fails, the overlay just stays
+            a normal (still working) window."""
+            if sys.platform != "win32" \
+                    or self.screen_overlay is None:
+                return
+            try:
+                import ctypes
+                hwnd = self.screen_overlay.winfo_id()
+                user32 = ctypes.windll.user32
+                GWL_EXSTYLE = -20
+                WS_EX_LAYERED = 0x00080000
+                WS_EX_TRANSPARENT = 0x00000020
+                WS_EX_TOPMOST = 0x00000008
+                get_long = getattr(user32, "GetWindowLongPtrW",
+                                   user32.GetWindowLongW)
+                set_long = getattr(user32, "SetWindowLongPtrW",
+                                   user32.SetWindowLongW)
+                style = get_long(hwnd, GWL_EXSTYLE)
+                set_long(hwnd, GWL_EXSTYLE,
+                         style | WS_EX_LAYERED | WS_EX_TRANSPARENT
+                         | WS_EX_TOPMOST)
+            except Exception:
+                pass
+
+        def capture_for_screen_translate(self, bbox=None):
+            """Screenshot for a Screen Translate scan.
+
+            The cover overlay is hidden for the instant of the
+            capture (withdraw -> capture -> show again), so its
+            own labels can never be read back. (They are English,
+            so the Arabic filter would ignore them anyway — this
+            is belt-and-suspenders.) Returns (image, error),
+            like capture_screen.
+            """
+            ov = self.screen_overlay
+            hidden = False
+            if ov is not None:
+                try:
+                    ov.withdraw()
+                    hidden = True
+                    time.sleep(0.08)
+                except Exception:
+                    hidden = False
+            try:
+                return capture_screen(bbox)
+            finally:
+                if hidden and ov is not None:
+                    try:
+                        ov.deiconify()
+                    except Exception:
+                        pass
+
+        def _screen_tick(self):
+            if not self.screen_translate_on:
+                return
+            if not self._screen_busy:
+                self._screen_busy = True
+                _label, hwnd = self._selected_target()
+                threading.Thread(
+                    target=self._screen_scan_worker,
+                    args=(hwnd, self.clear_mode_on),
+                    daemon=True).start()
+            self._screen_job = self.root.after(
+                SCREEN_TRANSLATE_INTERVAL_MS, self._screen_tick)
+
+        def _screen_scan_worker(self, hwnd, clear_mode):
+            try:
+                bbox = None
+                rect = None
+                if hwnd != WHOLE_SCREEN:
+                    rect = get_window_rect(hwnd)
+                    if rect is None:
+                        self._queue.put(
+                            ("status",
+                             "Screen Translate: that window is "
+                             "gone — pick it again or use Whole "
+                             "Screen."))
+                        return
+                    bbox = rect
+                img, err = self.capture_for_screen_translate(bbox)
+                if img is None:
+                    self._queue.put(("status", err))
+                    return
+                if rect is None:
+                    rect = (0, 0, img.size[0], img.size[1])
+                lines, err = ocr_lines_with_boxes(
+                    img, clear=clear_mode)
+                if err:
+                    self._queue.put(
+                        ("status", "Screen Translate: " + err))
+                    return
+                items = translate_screen_lines(
+                    lines, cache=self.screen_translations)
+                self._queue.put(("screen", (rect, items)))
+            except Exception as exc:
+                self._queue.put(
+                    ("status", "Screen Translate went wrong: %s"
+                     % exc))
+            finally:
+                self._screen_busy = False
+
+        def _apply_screen_scan(self, rect, items):
+            """Position the cover overlay over exactly the watched
+            area and redraw its labels — but only when the set of
+            (line, box, English) changed, so it does not flicker."""
+            if not self.screen_translate_on:
+                return
+            ov = self._ensure_screen_overlay()
+            left, top, right, bottom = rect
+            width = max(1, right - left)
+            height = max(1, bottom - top)
+            try:
+                ov.geometry("%dx%d%s%d%s%d" % (
+                    width, height,
+                    "+" if left >= 0 else "-", abs(left),
+                    "+" if top >= 0 else "-", abs(top)))
+                ov.deiconify()
+                ov.lift()
+            except Exception:
+                pass
+            self._make_screen_overlay_click_through()
+            signature = tuple(
+                (it["text"], it["box"], it["english"])
+                for it in items)
+            if signature == self._screen_signature:
+                return  # nothing changed — no flicker
+            self._screen_signature = signature
+            for child in ov.winfo_children():
+                child.destroy()
+            self.screen_labels = []
+            for it in items:
+                bx, by, bw, bh = it["box"]
+                screen_box = (left + bx, top + by, bw, bh)
+                x, y, w, h = label_geometry(screen_box, (left, top))
+                size = label_font_size(bh)
+                # English is often longer than the Arabic — give
+                # the label room, but never past the overlay edge.
+                need = int(len(it["english"]) * size * 0.58) + 12
+                w = max(w, need)
+                if x + w > width:
+                    w = max(10, width - x)
+                lbl = tk.Label(ov, text=it["english"],
+                               bg=SCREEN_LABEL_BG,
+                               fg=SCREEN_LABEL_FG,
+                               font=("Segoe UI", size, "bold"),
+                               padx=4, pady=1, justify="left",
+                               anchor="w")
+                lbl.place(x=x, y=y, width=w,
+                          height=max(h, size + 10))
+                self.screen_labels.append(lbl)
+
         # ---------- favorites ----------
 
         def _star_idea(self, card):
@@ -1753,6 +2198,9 @@ if tk is not None:
                             beep()
                     elif kind == "status":
                         self.set_status(payload)
+                    elif kind == "screen":
+                        rect, items = payload
+                        self._apply_screen_scan(rect, items)
                     elif kind == "mywords":
                         arabic, error = payload
                         if arabic is not None:
