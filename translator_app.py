@@ -31,11 +31,12 @@ import threading
 # the helper functions below can be imported and tested anywhere.
 try:
     import tkinter as tk
-    from tkinter import ttk, messagebox
+    from tkinter import ttk, messagebox, filedialog
 except Exception:  # pragma: no cover - no display / no tk
     tk = None
     ttk = None
     messagebox = None
+    filedialog = None
 
 APP_TITLE = "Mia's Arabic Screen Translator"
 SAMPLE_SENTENCE = "أَهْلًا، كَيْفَ حَالُكَ الْيَوْمَ؟"
@@ -242,6 +243,124 @@ TESSERACT_HELP = (
 )
 
 
+# ---------------------------------------------------------------------
+# Finding the Tesseract program
+#
+# The Windows installer (UB Mannheim) puts tesseract.exe in
+# C:\Program Files\Tesseract-OCR\ and does NOT add it to the PATH,
+# so just asking the system path is not enough — look in the usual
+# install folders too, and remember a folder the user picks by hand.
+# ---------------------------------------------------------------------
+
+TESSERACT_SETTINGS_FILENAME = "tesseract_settings.json"
+
+
+def default_tesseract_settings_path():
+    return os.path.join(os.path.dirname(os.path.abspath(__file__)),
+                        TESSERACT_SETTINGS_FILENAME)
+
+
+def load_tesseract_setting(path=None):
+    """Return the saved tesseract.exe path, or None. Never raises."""
+    import json
+    path = path or default_tesseract_settings_path()
+    try:
+        with open(path, "r", encoding="utf-8") as fh:
+            data = json.load(fh)
+        cmd = data.get("tesseract_cmd")
+        if cmd:
+            return str(cmd)
+    except Exception:
+        pass
+    return None
+
+
+def save_tesseract_setting(path_str, settings_path=None):
+    """Save the tesseract.exe path to the settings file.
+
+    Returns the settings file path.
+    """
+    import json
+    settings_path = settings_path or default_tesseract_settings_path()
+    with open(settings_path, "w", encoding="utf-8") as fh:
+        json.dump({"tesseract_cmd": str(path_str)}, fh,
+                  ensure_ascii=False, indent=1)
+    return settings_path
+
+
+def tesseract_candidate_paths():
+    """The usual Windows install locations for tesseract.exe.
+
+    Built from environment variables so tests can fake them.
+    """
+    candidates = []
+    program_files = os.environ.get("ProgramFiles")
+    program_files_x86 = os.environ.get("ProgramFiles(x86)")
+    local_app_data = os.environ.get("LOCALAPPDATA")
+    if program_files:
+        candidates.append(os.path.join(
+            program_files, "Tesseract-OCR", "tesseract.exe"))
+    if program_files_x86:
+        candidates.append(os.path.join(
+            program_files_x86, "Tesseract-OCR", "tesseract.exe"))
+    if local_app_data:
+        candidates.append(os.path.join(
+            local_app_data, "Programs", "Tesseract-OCR",
+            "tesseract.exe"))
+        candidates.append(os.path.join(
+            local_app_data, "Tesseract-OCR", "tesseract.exe"))
+    if program_files:
+        candidates.append(os.path.join(
+            program_files, "Tesseract-OCR", "bin", "tesseract.exe"))
+    return candidates
+
+
+def find_tesseract_cmd():
+    """Find tesseract.exe. Returns its path, or None.
+
+    Search order:
+    a) the path saved by the "Find Tesseract" button,
+    b) "tesseract" on the system PATH,
+    c) the usual Windows install folders.
+    Never raises.
+    """
+    try:
+        saved = load_tesseract_setting()
+        if saved and os.path.isfile(saved):
+            return saved
+    except Exception:
+        pass
+    try:
+        on_path = shutil.which("tesseract")
+        if on_path:
+            return on_path
+    except Exception:
+        pass
+    for candidate in tesseract_candidate_paths():
+        try:
+            if os.path.isfile(candidate):
+                return candidate
+        except Exception:
+            continue
+    return None
+
+
+def apply_tesseract_cmd():
+    """Point pytesseract at the found tesseract.exe.
+
+    Returns the path used, or None if Tesseract was not found.
+    Never raises.
+    """
+    cmd = find_tesseract_cmd()
+    if cmd:
+        try:
+            import pytesseract
+            pytesseract.pytesseract.tesseract_cmd = cmd
+        except Exception:
+            pass
+    return cmd
+
+
 def ocr_status():
     """Check whether screen-reading (OCR) is ready.
 
@@ -252,24 +371,28 @@ def ocr_status():
     except Exception:
         return False, ("pytesseract is not installed yet — run "
                        "run_translator.bat once, it installs it.")
-    # Is the Tesseract program itself there?
-    found_binary = shutil.which("tesseract") is not None
-    if not found_binary:
-        try:
-            pytesseract.get_tesseract_version()
-            found_binary = True
-        except Exception:
-            found_binary = False
-    if not found_binary:
-        return False, "Tesseract program not found.\n" + TESSERACT_HELP
+    # Find the Tesseract program itself (saved setting, PATH, or one
+    # of the usual install folders) and point pytesseract at it.
+    cmd = apply_tesseract_cmd()
+    if not cmd:
+        return False, (
+            "Tesseract program not found. I looked on the system "
+            "path and in the usual install folders (like "
+            "C:\\Program Files\\Tesseract-OCR). Press the "
+            "\"📁 Find Tesseract\" button and pick the "
+            "Tesseract-OCR folder — or reinstall Tesseract "
+            "(see README.txt).")
     try:
         langs = pytesseract.get_languages(config="")
     except Exception as exc:
         return False, "Could not check Tesseract languages: %s" % exc
     if "ara" not in langs:
-        return False, ("Tesseract is installed, but the Arabic language "
-                       "data is missing.\n" + TESSERACT_HELP)
-    return True, "Screen reading is ready (Tesseract + Arabic found)."
+        return False, (
+            "Tesseract is installed, but the Arabic language is "
+            "missing. Reinstall Tesseract and tick Arabic under "
+            "'Additional language data' on the 'Choose Components' "
+            "page, then reopen this app.")
+    return True, "Tesseract ready (Arabic found) at %s" % cmd
 
 
 def ocr_image(image, clear=True):
@@ -1060,6 +1183,12 @@ if tk is not None:
             self.ocr_label = tk.Label(root, text="", bg=BG, fg=WARN,
                                       wraplength=850, justify="left")
             self.ocr_label.pack(fill="x", padx=12)
+            ocr_tools = tk.Frame(root, bg=BG)
+            ocr_tools.pack(fill="x", padx=12)
+            tk.Button(ocr_tools, text="📁 Find Tesseract", relief="flat",
+                      bg=CARD, fg=TEXT, padx=10, pady=3,
+                      command=self._find_tesseract).pack(
+                          side="left", pady=2)
             self.status_label = tk.Label(root, text="Ready.",
                                          bg=BG, fg=MUTED, anchor="w")
             self.status_label.pack(fill="x", padx=12, pady=(2, 4))
@@ -1256,6 +1385,34 @@ if tk is not None:
             self.ocr_label.configure(
                 text=("✅ " if ok else "⚠ ") + msg,
                 fg=GOOD if ok else WARN)
+
+        def _find_tesseract(self):
+            if filedialog is None:
+                return
+            folder = filedialog.askdirectory(
+                title="Pick the Tesseract-OCR folder")
+            if not folder:
+                return
+            candidate = os.path.join(folder, "tesseract.exe")
+            if os.path.isfile(candidate):
+                try:
+                    save_tesseract_setting(candidate)
+                except Exception:
+                    pass
+                apply_tesseract_cmd()
+                self._update_ocr_label()
+                self.set_status(
+                    "✅ Found it! Tesseract is set up: " + candidate)
+            else:
+                self.set_status(
+                    "⚠ No tesseract.exe in that folder — pick the "
+                    "Tesseract-OCR folder itself.")
+                if messagebox is not None:
+                    messagebox.showerror(
+                        APP_TITLE,
+                        "There is no tesseract.exe in that folder.\n"
+                        "Pick the Tesseract-OCR folder itself "
+                        "(usually in Program Files).")
 
         def _copy_text(self, text, btn=None):
             if not text:

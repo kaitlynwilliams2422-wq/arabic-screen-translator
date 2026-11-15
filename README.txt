@@ -94,6 +94,28 @@ button still works — it just cannot read your screen yet, and
 it will tell you so. It never makes up text.
 
 
+IF THE APP SAYS TESSERACT IS NOT FOUND
+
+The app looks for Tesseract by itself in the usual install
+folders (like C:\Program Files\Tesseract-OCR), so most of the
+time it just finds it — even though the installer does not put
+it on the system path.
+
+If it still says "Tesseract program not found":
+
+1) Press the "📁 Find Tesseract" button under the yellow note
+   at the top of the app.
+
+2) Pick the Tesseract-OCR folder itself (usually in
+   Program Files). The app remembers it, and the note should
+   turn green.
+
+If the note says Tesseract is installed but the Arabic
+language is missing, reinstall Tesseract and this time tick
+"Arabic" under "Additional language data" on the
+"Choose Components" page (see the install steps above).
+
+
 HOW TO USE IT (WITH ROBLOX)
 
 1) Open Roblox and join your game first.
